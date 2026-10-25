@@ -18,6 +18,12 @@ const beads = [
   bead("nested", { issue_type: "epic", dependencies: [dep("nested", "epic", "parent-child")] }),
   bead("child", { dependencies: [dep("child", "nested", "parent-child")] }),
   bead("archived", { labels: ["archived"] }),
+  // The frontier fixture: an open bead that blocks another, a bead whose status
+  // is blocked, and one in progress.
+  bead("frontier-open"),
+  bead("frontier-dep", { dependencies: [dep("frontier-dep", "frontier-open")] }),
+  bead("status-blocked", { status: "blocked" }),
+  bead("wip", { status: "in_progress" }),
 ];
 const browser = await chromium.launch();
 try {
@@ -55,8 +61,27 @@ try {
   const filter = page.getByRole("checkbox", { name: "Live dependencies only" });
   await filter.check();
   await page.locator('.react-flow__node[data-id="finished"]').waitFor({ state: "detached" });
-  assert.deepEqual(await ids(), ["child", "epic", "linked-a", "linked-b", "nested"]);
+  assert.deepEqual(await ids(), ["child", "epic", "frontier-dep", "frontier-open", "linked-a", "linked-b", "nested"]);
   await filter.uncheck();
+  // Frontier only: open or in-progress beads that nothing blocks, plus the epics
+  // they sit in. linked-a and frontier-dep wait on open beads, so they go;
+  // the status-blocked and closed beads go; the in-progress bead stays; the
+  // nested epic and its parent stay because "child" is on the frontier.
+  const frontier = page.getByRole("checkbox", { name: "Frontier only" });
+  await frontier.check();
+  await page.locator('.react-flow__node[data-id="linked-a"]').waitFor({ state: "detached" });
+  assert.deepEqual(await ids(), ["child", "epic", "frontier-open", "linked-b", "nested", "new-a", "new-b", "wip"],
+    "Frontier must hide blocked, status-blocked and closed beads and keep in-progress ones");
+  // Edges render after the nodes measure, so wait for them as the drag test does.
+  await page.waitForFunction(() => document.querySelectorAll(".react-flow__edge").length === 2);
+  assert.equal(await page.locator(".react-flow__edge.animated").count(), 0,
+    "Only parent-child edges (child->nested, nested->epic) survive on the frontier; no animated blocking edge can");
+  assert.ok(await page.getByRole("checkbox", { name: "Live dependencies only" }).isDisabled(),
+    "Frontier implies live, so the live checkbox is disabled while frontier is on");
+  await frontier.uncheck();
+  await page.locator('.react-flow__node[data-id="finished"]').waitFor();
+  assert.deepEqual(await ids(), beads.filter((b) => b.id !== "archived").map((b) => b.id).sort(),
+    "Turning frontier off restores the full set");
   const source = page.locator('.react-flow__node[data-id="new-a"] .react-flow__handle.source');
   const target = page.locator('.react-flow__node[data-id="new-b"] .react-flow__handle.target');
   await source.waitFor();
@@ -67,7 +92,7 @@ try {
   await page.mouse.down();
   await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 20 });
   await page.mouse.up();
-  await page.waitForFunction(() => document.querySelectorAll(".react-flow__edge").length === 4);
+  await page.waitForFunction(() => document.querySelectorAll(".react-flow__edge").length === 5);
   assert.deepEqual(connection, { depends_on_id: "new-b", type: "blocks" },
     "Previously unlinked tasks must still support drag-to-link");
   await page.locator('.react-flow__node[data-id="finished"]').click();
@@ -124,7 +149,7 @@ try {
   await page.waitForTimeout(300);
   assert.ok(await fits(), "Built-in fit control must fit large graphs too");
   assert.deepEqual(errors, []);
-  console.log("PASS: full graph, optional pruning, unique nested epics, drag-to-link, closed-task details, empty-filter recovery, and wrapped layout");
+  console.log("PASS: full graph, optional pruning, frontier, unique nested epics, drag-to-link, closed-task details, empty-filter recovery, and wrapped layout");
 } finally {
   await browser.close();
 }

@@ -16,7 +16,7 @@ import "@xyflow/react/dist/style.css";
 import { Icon, typeIconName } from "@/components/icons";
 import { useApp } from "@/components/app-context";
 import { useAddDep } from "@/hooks/use-beads";
-import { catColor, typeColor, childrenOf } from "@/lib/beads-view";
+import { catColor, typeColor, childrenOf, isBlocked, makeIndex } from "@/lib/beads-view";
 import { buildEpicGraphScope, graphDependencyLayers } from "@/lib/graph-epic";
 import { graphNeighborhood } from "@/lib/graph-neighborhood";
 import type { Bead } from "@/lib/schema";
@@ -153,6 +153,47 @@ function liveGraphBeads(beads: Bead[], alwaysVisible = new Set<string>()): Bead[
   );
 }
 
+/**
+ * The frontier: what can be picked up now. A bead is on it when it is open or
+ * in progress and nothing unresolved holds it up (isBlocked, resolved against
+ * the FULL bead set, so a closed blocker counts as resolved even when the
+ * closed bead itself is hidden). Closed, blocked, deferred and hooked beads
+ * drop out. An epic stays only while one of its descendants is on the
+ * frontier, so it keeps grouping; an empty epic goes. Among frontier beads no
+ * open blocking edge can survive by construction, so what remains is
+ * parent-child and related edges.
+ */
+function frontierBeads(beads: Bead[], all: Bead[], alwaysVisible = new Set<string>()): Bead[] {
+  const index = makeIndex(all);
+  const visible = new Set<string>();
+  for (const bead of beads) {
+    if (alwaysVisible.has(bead.id)) { visible.add(bead.id); continue; }
+    if (bead.issue_type === "epic") continue;
+    if (bead.status !== "open" && bead.status !== "in_progress") continue;
+    if (isBlocked(bead, index)) continue;
+    visible.add(bead.id);
+  }
+  // Epics inherit visibility from their children, nested epics included, so
+  // iterate until no epic changes.
+  const epics = beads.filter((bead) => bead.issue_type === "epic");
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const epic of epics) {
+      if (visible.has(epic.id)) continue;
+      const lit = beads.some(
+        (bead) =>
+          visible.has(bead.id) &&
+          (bead.dependencies ?? []).some(
+            (dependency) => dependency.type === "parent-child" && dependency.depends_on_id === epic.id,
+          ),
+      );
+      if (lit) { visible.add(epic.id); changed = true; }
+    }
+  }
+  return beads.filter((bead) => visible.has(bead.id));
+}
+
 function layout(beads: Bead[], onOpen: (id: string) => void): { nodes: Node[]; edges: Edge[] } {
   const epics = beads.filter((b) => b.issue_type === "epic");
 
@@ -234,6 +275,9 @@ export function GraphView() {
   const { beads, openDetail, readOnly } = useApp();
   const [epicId, setEpicId] = React.useState("");
   const [liveOnly, setLiveOnly] = React.useState(false);
+  // Frontier implies live: with it on, the live checkbox reads as checked and
+  // is disabled, and the frontier predicate decides what shows.
+  const [frontierOnly, setFrontierOnly] = React.useState(false);
   const [spotlight, setSpotlight] = React.useState(false);
   const [focusId, setFocusId] = React.useState<string | null>(null);
   const activateNode = React.useCallback((id: string) => {
@@ -263,17 +307,25 @@ export function GraphView() {
     const nonArchived = beads.filter((bead) => !(bead.labels ?? []).includes("archived"));
     if (effectiveEpicId) {
       const scope = buildEpicGraphScope(nonArchived, effectiveEpicId);
-      const visible = liveOnly
-        ? liveGraphBeads(scope.beads, new Set([effectiveEpicId]))
-        : scope.beads;
+      // Outside neighbours stay as context in every mode; the frontier rule
+      // applies to the scope itself.
+      const visible = frontierOnly
+        ? frontierBeads(scope.beads, beads, new Set([effectiveEpicId, ...scope.outsideIds]))
+        : liveOnly
+          ? liveGraphBeads(scope.beads, new Set([effectiveEpicId]))
+          : scope.beads;
       return {
         ...epicLayout(visible, activateNode, scope.outsideIds),
         considered: scope.beads.length,
       };
     }
-    const visible = liveOnly ? liveGraphBeads(nonArchived) : nonArchived;
+    const visible = frontierOnly
+      ? frontierBeads(nonArchived, beads)
+      : liveOnly
+        ? liveGraphBeads(nonArchived)
+        : nonArchived;
     return { ...layout(visible, activateNode), considered: nonArchived.length };
-  }, [beads, activateNode, effectiveEpicId, liveOnly]);
+  }, [beads, activateNode, effectiveEpicId, liveOnly, frontierOnly]);
   const hidden = Math.max(0, considered - nodes.length);
   const focus = React.useMemo(() => {
     if (!spotlight || !focusId || !nodes.some(n => n.id === focusId)) return null;
@@ -324,7 +376,13 @@ export function GraphView() {
             {hidden > 0 && (
               <>
                 {" · "}
-                <span title="Turn off Live dependencies only to include closed and unlinked beads.">
+                <span
+                  title={
+                    frontierOnly
+                      ? "Frontier only shows open or in-progress beads that nothing blocks, and the epics they sit in. Turn it off to see closed, blocked and deferred beads."
+                      : "Turn off Live dependencies only to include closed and unlinked beads."
+                  }
+                >
                   {hidden} hidden by filter
                 </span>
               </>
@@ -356,11 +414,24 @@ export function GraphView() {
         <label className="flex cursor-pointer items-center gap-2 text-[12px] text-[var(--text-2)]">
           <input
             type="checkbox"
-            checked={liveOnly}
+            checked={liveOnly || frontierOnly}
+            disabled={frontierOnly}
             onChange={(e) => { setLiveOnly(e.target.checked); setFocusId(null); }}
             className="accent-[var(--brand)]"
           />
           Live dependencies only
+        </label>
+        <label
+          className="flex cursor-pointer items-center gap-2 text-[12px] text-[var(--text-2)]"
+          title="Only what can be picked up now: open or in-progress beads that nothing blocks, grouped under their epics"
+        >
+          <input
+            type="checkbox"
+            checked={frontierOnly}
+            onChange={(e) => { setFrontierOnly(e.target.checked); setFocusId(null); }}
+            className="accent-[var(--brand)]"
+          />
+          Frontier only
         </label>
         <button
           onClick={center}
@@ -386,7 +457,7 @@ export function GraphView() {
       <div className="relative min-h-0 flex-1">
         <SpotlightContext.Provider value={spotlightContext}>
         <ReactFlow
-          key={`${effectiveEpicId || "all"}:${liveOnly ? "live" : "complete"}`}
+          key={`${effectiveEpicId || "all"}:${frontierOnly ? "frontier" : liveOnly ? "live" : "complete"}`}
           nodes={nodes}
           edges={shownEdges}
           zoomOnDoubleClick={!spotlight}
@@ -411,16 +482,22 @@ export function GraphView() {
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
             <div className="pointer-events-auto max-w-[360px] rounded-[12px] border border-border bg-[var(--surface)] p-[16px_18px] text-center shadow-[var(--shadow)]">
               <div className="text-[13px] font-[650] text-[var(--text)]">
-                {liveOnly && considered > 0 ? "No live dependencies" : "No beads to show"}
+                {frontierOnly && considered > 0
+                  ? "Nothing on the frontier"
+                  : liveOnly && considered > 0
+                    ? "No live dependencies"
+                    : "No beads to show"}
               </div>
               <p className="m-0 mt-[6px] text-[12px] leading-[1.5] text-[var(--text-2)]">
                 {considered === 0
                   ? "There are no non-archived beads in this project."
-                  : "The current filter hides all beads. Show all beads to inspect completed work or create new dependencies."}
+                  : frontierOnly
+                    ? "Every bead here is closed, blocked, deferred or hooked. Show all beads to see what is holding the rest up."
+                    : "The current filter hides all beads. Show all beads to inspect completed work or create new dependencies."}
               </p>
-              {liveOnly && considered > 0 && (
+              {(liveOnly || frontierOnly) && considered > 0 && (
                 <button
-                  onClick={() => setLiveOnly(false)}
+                  onClick={() => { setLiveOnly(false); setFrontierOnly(false); }}
                   className="mt-3 rounded-lg border border-border px-3 py-1.5 text-[12px] hover:bg-[var(--surface-2)]"
                 >
                   Show all beads
